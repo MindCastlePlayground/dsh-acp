@@ -1,0 +1,30 @@
+# dsh-acp — mount a row that supervises an ACP agent and exposes it as a model.
+#
+# Replace `command` with the agent launcher you actually have installed. On
+# Windows, `opencode` resolves to a .cmd wrapper through PATH + PATHEXT, and the
+# plugin's `shell: auto` then runs it through a shell. Agents that read their own
+# config (opencode) need no env at all.
+#
+# `defaultModel` only seeds `acp_selftest`; the model picker lists everything the
+# agent reports. This one is a free opencode model, so the fresh install has
+# something that answers without a top-up.
+- insert:
+    - id: acp
+      name: '@local/dsh-acp'
+      config:
+        agents:
+          opencode:
+            displayName: OpenCode
+            description: Local opencode agent mounted through the Agent Client Protocol.
+            command: opencode
+            args:
+              - acp
+            autoStart: true
+            permission:
+              policy: allow
+            provider:
+              route: acp-opencode
+              defaultModel: opencode/deepseek-v4.1-flash-free
+              discoverModels: true
+              contextWindow: 200000
+              maxTokens: 32768

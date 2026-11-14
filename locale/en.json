@@ -1,0 +1,11 @@
+{
+  "meta": {
+    "title": "ACP Bridge",
+    "description": "Mount ACP (Agent Client Protocol) agents such as opencode as selectable model routes."
+  },
+  "config": {
+    "agents": {
+      "description": "ACP agents to supervise, keyed by id."
+    }
+  }
+}

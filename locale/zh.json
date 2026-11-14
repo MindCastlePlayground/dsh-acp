@@ -1,0 +1,11 @@
+{
+  "meta": {
+    "title": "ACP 桥接",
+    "description": "把 opencode 等 ACP（Agent Client Protocol）智能体挂载为可选的模型路由。"
+  },
+  "config": {
+    "agents": {
+      "description": "要托管的 ACP 智能体，按 id 配置。"
+    }
+  }
+}
