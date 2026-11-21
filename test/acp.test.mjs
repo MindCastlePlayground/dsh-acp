@@ -13,6 +13,8 @@ import { normalizeConfig, AcpConfigError } from '../lib/config.js'
 import { AcpAgent } from '../lib/agent.js'
 import { createAcpAdapter, mapStopReason, mapUsage, decidePermission, contentText } from '../lib/adapter.js'
 import { planPrompt, renderTranscript, projectCall } from '../lib/transcript.js'
+import { McpGateway } from '../lib/mcp-gateway.js'
+import { createMcpBridge } from '../lib/mcp-bridge.js'
 
 const testDir = path.dirname(fileURLToPath(import.meta.url))
 const fakeAgent = path.join(testDir, 'fake-agent.mjs')
@@ -432,4 +434,181 @@ test('permission decisions fall back to cancelled when the agent offers no match
     options: [{ optionId: 'no', kind: 'reject_once' }],
   }, { trace() {} })
   assert.deepEqual(rejected, { outcome: { outcome: 'selected', optionId: 'no' } })
+})
+
+// --- MCP injection over a real session -------------------------------------
+
+/** A ctx whose services are the doubles a test cares about. */
+function makeServiceCtx({ tools, skills, agents } = {}) {
+  const services = { tools, skills, agents }
+  return {
+    logger: silentLogger,
+    emit() {},
+    get(key) { return services[key] },
+  }
+}
+
+function stubToolsRegistry() {
+  const calls = []
+  return {
+    calls,
+    schemas: () => [
+      { name: 'bash', description: 'Run a shell command.', parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } },
+      { name: 'acp_status', description: 'Bridge control.', parameters: { type: 'object', properties: {} } },
+    ],
+    async execute(exec) {
+      calls.push(exec)
+      return { isError: false, content: [{ type: 'text', text: `ran ${exec.arguments.command}` }], value: { code: 0 } }
+    },
+  }
+}
+
+test('an agent with no model picker still gets one routable model', async (t) => {
+  const config = makeConfig({
+    env: { FAKE_ACP_MODE: 'no-model-options' },
+    provider: { route: 'acp-fake', discoverModels: true, models: [] },
+  })
+  await withAgent(t, config, async (agent) => {
+    const models = await agent.listModels()
+    assert.equal(models.length, 1)
+    assert.equal(models[0].id, 'default')
+    assert.match(models[0].name, /Fake/)
+    // The synthetic id is never sent to an agent that has no options.
+    const session = await agent.createSession()
+    assert.deepEqual(session.configOptions, [])
+    await agent.closeSession(session.sessionId)
+  })
+})
+
+test('session/new carries an HTTP MCP descriptor when the agent advertises it', async (t) => {
+  const config = makeConfig()
+  const ctx = makeServiceCtx({ tools: stubToolsRegistry() })
+  const gateway = new McpGateway({ log: undefined })
+  t.after(() => gateway.dispose())
+  const bridge = createMcpBridge({ ctx, gateway, log: undefined })
+  await withAgent(t, config, async (agent) => {
+    const adapter = createAcpAdapter({ agent, config: config.agents[0], log: agent.logs, ctx, mcpBridge: bridge })
+    const { finish } = await collect(adapter.stream({
+      provider: 'acp-fake',
+      model: 'fake/model-one',
+      sessionId: 'dsh-session-1',
+      messages: [userTurn('ping')],
+    }))
+    assert.deepEqual(finish, { kind: 'stop' })
+
+    const state = await agent.connection.request('debug/state')
+    assert.equal(state.sessions.length, 1)
+    const [server] = state.sessions[0].mcpServers
+    assert.equal(server.name, 'dsh')
+    assert.equal(server.type, 'http')
+    assert.match(server.url, /^http:\/\/127\.0\.0\.1:\d+\/mcp\/[0-9a-f]+$/)
+    assert.equal(server.headers[0].name, 'Authorization')
+    assert.match(server.headers[0].value, /^Bearer [0-9a-f]+$/)
+
+    // The advertised endpoint really serves the owning agent's tools.
+    const post = (body) => fetch(server.url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: server.headers[0].value },
+      body: JSON.stringify(body),
+    })
+    const listed = await (await post({ jsonrpc: '2.0', id: 1, method: 'tools/list' })).json()
+    assert.deepEqual(listed.result.tools.map((tool) => tool.name), ['bash'])
+    const called = await (await post({
+      jsonrpc: '2.0',
+      id: 2,
+      method: 'tools/call',
+      params: { name: 'bash', arguments: { command: 'pwd' } },
+    })).json()
+    assert.deepEqual(called.result.content, [{ type: 'text', text: 'ran pwd' }])
+    await adapter.release()
+  })
+})
+
+test('a stdio-only agent gets the shim, and the token is the only credential', async (t) => {
+  const config = makeConfig({
+    env: { FAKE_ACP_MODE: 'stdio-mcp' },
+    mcp: { transport: 'stdio' },
+  })
+  const tools = stubToolsRegistry()
+  const ctx = makeServiceCtx({ tools })
+  const gateway = new McpGateway({ log: undefined })
+  t.after(() => gateway.dispose())
+  const bridge = createMcpBridge({ ctx, gateway, log: undefined })
+  await withAgent(t, config, async (agent) => {
+    const adapter = createAcpAdapter({ agent, config: config.agents[0], log: agent.logs, ctx, mcpBridge: bridge })
+    await collect(adapter.stream({
+      provider: 'acp-fake',
+      model: 'fake/model-one',
+      sessionId: 'dsh-session-2',
+      messages: [userTurn('ping')],
+    }))
+    const state = await agent.connection.request('debug/state')
+    const [server] = state.sessions[0].mcpServers
+    assert.equal(server.type, undefined, 'stdio descriptors carry no type field')
+    assert.equal(server.command, process.execPath)
+    assert.match(server.args[0], /mcp-stdio\.js$/)
+    const env = Object.fromEntries(server.env.map((entry) => [entry.name, entry.value]))
+    assert.match(env.DSH_ACP_MCP_URL, /^http:\/\/127\.0\.0\.1:\d+\/mcp\//)
+    assert.match(env.DSH_ACP_MCP_TOKEN, /^[0-9a-f]+$/)
+
+    // The URL alone is not enough: the token must accompany it.
+    const bare = await fetch(env.DSH_ACP_MCP_URL, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+    })
+    assert.equal(bare.status, 401)
+    await adapter.release()
+  })
+})
+
+test('a tool call from the agent runs under the owning DSH agent', async (t) => {
+  const config = makeConfig()
+  const tools = stubToolsRegistry()
+  const dshAgent = { id: 'dsh-agent-stub' }
+  const ctx = makeServiceCtx({ tools, agents: { get: (id) => (id === 'dsh-session-3' ? dshAgent : undefined) } })
+  const gateway = new McpGateway({ log: undefined })
+  t.after(() => gateway.dispose())
+  const bridge = createMcpBridge({ ctx, gateway, log: undefined })
+  await withAgent(t, config, async (agent) => {
+    const adapter = createAcpAdapter({ agent, config: config.agents[0], log: agent.logs, ctx, mcpBridge: bridge })
+    await collect(adapter.stream({
+      provider: 'acp-fake',
+      model: 'fake/model-one',
+      sessionId: 'dsh-session-3',
+      messages: [userTurn('ping')],
+    }))
+    const state = await agent.connection.request('debug/state')
+    const [server] = state.sessions[0].mcpServers
+    await fetch(server.url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: server.headers[0].value },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'bash', arguments: { command: 'ls' } } }),
+    })
+    assert.equal(tools.calls.length, 1)
+    assert.equal(tools.calls[0].agent, dshAgent, 'the tool must see the session that owns the model call')
+    await adapter.release()
+  })
+})
+
+test('session options and authenticate are applied generically', async (t) => {
+  const config = makeConfig({
+    session: { options: { custom_option: 'custom-value' } },
+    auth: { methodId: 'fake-login', auto: true },
+  })
+  await withAgent(t, config, async (agent) => {
+    await agent.start()
+    const state = await agent.connection.request('debug/state')
+    assert.equal(state.authenticated, 'fake-login')
+    const adapter = createAcpAdapter({ agent, config: config.agents[0], log: agent.logs })
+    await collect(adapter.stream({
+      provider: 'acp-fake',
+      model: 'fake/model-one',
+      sessionId: 'dsh-session-4',
+      messages: [userTurn('ping')],
+    }))
+    const after = await agent.connection.request('debug/state')
+    assert.equal(after.sessions[0].config.custom_option, 'custom-value')
+    await adapter.release()
+  })
 })

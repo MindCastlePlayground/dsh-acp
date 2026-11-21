@@ -1,7 +1,7 @@
 {
   "meta": {
     "title": "ACP Bridge",
-    "description": "Mount ACP (Agent Client Protocol) agents such as opencode as selectable model routes."
+    "description": "Mount any ACP (Agent Client Protocol) agent as a model route, with DSH tools injected over MCP."
   },
   "config": {
     "agents": {

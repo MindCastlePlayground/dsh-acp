@@ -1,13 +1,14 @@
-# dsh-acp — mount a row that supervises an ACP agent and exposes it as a model.
+# dsh-acp — supervise ACP agents and expose them as models, with DSH tools injected over MCP.
 #
-# Replace `command` with the agent launcher you actually have installed. On
-# Windows, `opencode` resolves to a .cmd wrapper through PATH + PATHEXT, and the
-# plugin's `shell: auto` then runs it through a shell. Agents that read their own
-# config (opencode) need no env at all.
+# Replace `command` with the agent launcher you actually have installed. On Windows a bare
+# `opencode` resolves to its .cmd wrapper through PATH + PATHEXT, and `shell: auto` runs it.
+# Agents that read their own config (opencode) need no env at all.
 #
-# `defaultModel` only seeds `acp_selftest`; the model picker lists everything the
-# agent reports. This one is a free opencode model, so the fresh install has
-# something that answers without a top-up.
+# A second agent is just another entry under `agents:` with its own id and `provider.route`.
+# Anything agent-specific belongs in `env`, `session.options` or `auth`, not in this plugin.
+#
+# `defaultModel` only seeds `acp_selftest`; the model picker lists everything the agent reports.
+# This one is a free opencode model, so a fresh install has something that answers without a top-up.
 - insert:
     - id: acp
       name: '@local/dsh-acp'
@@ -22,9 +23,26 @@
             autoStart: true
             permission:
               policy: allow
+            # DSH's tools (including every other plugin's) are offered to the agent as an MCP
+            # server scoped to the session that made the model call. The listener is loopback-only
+            # and authenticated per session; `auto` uses HTTP when the agent advertises it.
+            mcp:
+              enabled: true
+              transport: auto
             provider:
               route: acp-opencode
               defaultModel: opencode/deepseek-v4.1-flash-free
               discoverModels: true
               contextWindow: 200000
               maxTokens: 32768
+          # A second agent only needs its own id and route:
+          #
+          # claude:
+          #   displayName: Claude Code
+          #   command: claude-code-acp
+          #   args: []
+          #   auth:
+          #     methodId: claude-login
+          #   provider:
+          #     route: acp-claude
+          #     # No model picker: one synthetic id is registered automatically.

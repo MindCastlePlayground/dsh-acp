@@ -1,15 +1,18 @@
 {
   "name": "@local/dsh-acp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "Bridge ACP (Agent Client Protocol) agents such as opencode into DeepSeek Harness as selectable model routes.",
+  "description": "Mount any ACP (Agent Client Protocol) agent as a DeepSeek Harness model route, and inject DSH's tools into it over MCP.",
   "keywords": [
     "dsh",
     "dsh-plugin",
     "acp",
     "agent-client-protocol",
-    "opencode"
+    "mcp",
+    "model-context-protocol",
+    "opencode",
+    "claude-code"
   ],
   "exports": {
     ".": "./index.js",

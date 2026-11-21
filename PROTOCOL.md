@@ -1,8 +1,9 @@
 # ACP wire behaviour relied on by dsh-acp
 
-Everything here was observed against `opencode acp` (OpenCode 2.2.7) and is implemented in
-`lib/rpc.js`, `lib/agent.js` and `lib/adapter.js`. It documents what the bridge depends on, so a
-future agent change can be diagnosed against concrete expectations.
+Everything here was observed against `opencode acp` (OpenCode 2.2.7), and where it matters against
+the ACP schema. It is implemented in `lib/rpc.js`, `lib/agent.js`, `lib/adapter.js` and the `lib/mcp*`
+modules. It documents what the bridge depends on, so a future agent change can be diagnosed against
+concrete expectations.
 
 ## Transport
 
@@ -50,8 +51,13 @@ three:
 | `effort` | `thought_level` | `select` | `low`, `high`, `max`, `default`. |
 | `mode` | `mode` | `select` | `build`, `plan`. |
 
-Note the field name drift: `model` uses `currentValue`, `effort` and `mode` used `current` in some
-builds. The adapter reads both.
+Options are matched by `category`, never by id, so an agent that renames `effort` to `reasoning` still
+gets its value set. Note the field name drift: `model` uses `currentValue`, `effort` and `mode` used
+`current` in some builds. The adapter reads both.
+
+An agent with no model option at all (Claude Code, Codex) returns a short or empty `configOptions`.
+That is not an error: the route registers one synthetic model id and skips `session/set_config_option`
+entirely.
 
 ```json
 → {"jsonrpc":"2.0","id":3,"method":"session/set_config_option",
@@ -60,6 +66,85 @@ builds. The adapter reads both.
 ```
 
 `session/close` returns `{}` and is best-effort; the process tree is killed regardless.
+
+## Authentication
+
+```json
+→ {"jsonrpc":"2.0","id":5,"method":"authenticate","params":{"methodId":"opencode-login"}}
+← {"jsonrpc":"2.0","id":5,"result":{}}
+```
+
+Only sent when `auth.methodId` is configured (and `auth.auto`, or via `acp_control`). It is safe to
+call for an agent that is already logged in: opencode reports `opencode-login` unconditionally and
+answers.
+
+## MCP injection
+
+`session/new` is the only way to give an ACP agent tools. `mcpServers` is a list of server
+descriptors in one of two shapes; both were verified against opencode 2.2.7, driven by this plugin.
+
+```json
+// HTTP: sent when the agent advertises agentCapabilities.mcpCapabilities.http === true
+{"type":"http","name":"dsh",
+ "url":"http://127.0.0.1:53370/mcp/<token>",
+ "headers":[{"name":"Authorization","value":"Bearer <token>"}]}
+
+// stdio: the baseline every ACP agent supports
+{"name":"dsh",
+ "command":"C:\\nvm4w\\nodejs\\node.exe",
+ "args":["<package>/lib/mcp-stdio.js","http://127.0.0.1:53433/mcp/<token>"],
+ "env":[{"name":"DSH_ACP_MCP_URL","value":"http://127.0.0.1:53433/mcp/<token>"},
+        {"name":"DSH_ACP_MCP_TOKEN","value":"<token>"}]}
+```
+
+An SSE descriptor (`{"type":"sse","url":…}`) is never sent: opencode reports `sse: false`, and the
+HTTP shape covers the agents that implement either.
+
+The agent connects on its own schedule, often a few seconds after `session/new` returns:
+
+```json
+→ {"jsonrpc":"2.0","method":"notifications/initialized"}
+← {"jsonrpc":"2.0","method":"notifications/initialized"}   // relayed, never answered
+→ {"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+     "protocolVersion":"2025-11-25","clientInfo":{"name":"opencode","version":"2.2.7"},
+     "capabilities":{"elicitation":{"form":{},"url":{}},"roots":{}}}}
+← {"jsonrpc":"2.0","id":1,"result":{
+     "protocolVersion":"2025-11-25",
+     "capabilities":{"tools":{"listChanged":false},"prompts":{"listChanged":false},
+                     "resources":{"subscribe":false,"listChanged":false,"templates":true}},
+     "serverInfo":{"name":"dsh-opencode","title":"DeepSeek Harness (OpenCode)","version":"0.2.0"}}}
+```
+
+The server answers with the client's revision when it can speak it. `2025-11-25`, `2025-06-18`,
+`2025-03-26` and `2024-11-05` are accepted; the tools/prompts/resources surface is identical across
+them, and unknown methods return `-32601` rather than pretending.
+
+Methods served: `initialize`, `ping`, `tools/list`, `tools/call`, `prompts/list`, `prompts/get`,
+`resources/list`, `resources/templates/list`, `resources/read`. Notifications are never answered.
+`GET` returns 405 — there is no server-initiated stream and no resumable session — and a
+notification-only `POST` returns `202` with an empty body.
+
+Authentication is by capability token only: the token is in the URL path, and it must also arrive as
+`Authorization: Bearer <token>` (HTTP) or in `DSH_ACP_MCP_TOKEN` (stdio). A token is minted per ACP
+session, withdrawn when that session retires, and the listener binds to loopback on an OS-assigned
+port only after the first session needs it.
+
+### What a `tools/call` does
+
+```json
+→ {"jsonrpc":"2.0","id":2,"method":"tools/call",
+   "params":{"name":"bash","arguments":{"command":"pwd"}}}
+← {"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"…"}]}}
+```
+
+The call executes through `ctx.tools.execute` with the DSH **Agent that owns the model call**, looked
+up from the `sessionId` DSH passed to the adapter. That is what makes an agent's tool use respect the
+session's workspace, approvals, sandbox policy and per-agent tool restrictions, instead of running
+with a global view.
+
+A failing tool returns `{"content":[…],"isError":true}` — never a JSON-RPC error, because the model
+has to read the failure to recover. Only protocol mistakes (unknown method, missing `name`) become
+JSON-RPC errors.
 
 ## Prompts
 
@@ -152,7 +237,13 @@ Rules the mapper enforces:
 ## Sequencing notes
 
 - `initialize` must complete before `session/new`; `session/new` before `session/prompt`.
+- The transport choice for MCP reads `agentCapabilities`, so the handshake must have finished before
+  the descriptors are built. The bridge starts the agent first for exactly this reason; otherwise a
+  first call would always fall back to stdio.
 - Only one prompt per session is in flight at a time. The bridge serializes because it pools one
   session per DSH session id.
 - Conversation continuity across prompts on one session is real: a second prompt referring to the
   first is answered from context, which is what makes incremental prompting safe.
+- The agent may connect to the MCP endpoint at any point after `session/new` — before, during, or
+  seconds after the first prompt. The token is therefore registered before `session/new` is sent and
+  the session context is filled in when it returns.

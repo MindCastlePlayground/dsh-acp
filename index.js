@@ -18,6 +18,8 @@ import { fileURLToPath } from 'node:url'
 import { normalizeConfig, AcpConfigError } from './lib/config.js'
 import { AcpManager } from './lib/manager.js'
 import { registerAcpTools } from './lib/tools.js'
+import { createMcpBridge } from './lib/mcp-bridge.js'
+import { McpGateway } from './lib/mcp-gateway.js'
 
 const packageDir = path.dirname(fileURLToPath(import.meta.url))
 
@@ -50,7 +52,22 @@ export function apply(ctx, rawConfig) {
     return process.cwd()
   }
 
-  const manager = new AcpManager({ config, ctx, defaultCwd })
+  // MCP traffic is traced into the owning agent's log, but the gateway is built
+  // before the manager that owns those logs, so it writes through this indirection.
+  const mcpLog = {
+    trace(event, data) {
+      try {
+        for (const agent of manager.agents) agent.logs.trace(`mcp:${event}`, data)
+      } catch {}
+    },
+  }
+
+  // One listener serves every agent: the endpoint path carries the session
+  // token, so a peer cannot reach another session's tools by guessing a port.
+  const gateway = new McpGateway({ log: mcpLog })
+  const mcpBridge = createMcpBridge({ ctx, gateway, log: mcpLog })
+
+  const manager = new AcpManager({ config, ctx, defaultCwd, mcpGateway: gateway, mcpBridge })
 
   const llm = ctx.get('llm')
   if (llm === undefined) {
@@ -109,6 +126,7 @@ export function apply(ctx, rawConfig) {
       }
       await manager.releaseSessions()
       await manager.dispose()
+      await gateway.dispose()
     }
   }, 'dsh-acp: lifecycle and autostart')
 }

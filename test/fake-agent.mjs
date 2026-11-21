@@ -16,6 +16,7 @@ const THOUGHT = process.env.FAKE_ACP_THOUGHT ?? 'thinking about the ping'
 let nextRequestId = 1000
 const sessions = new Map()
 const pendingPermissions = new Map()
+let authenticated = null
 
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`)
@@ -188,7 +189,7 @@ rl.on('line', (line) => {
         agentCapabilities: {
           loadSession: true,
           promptCapabilities: { image: false, embeddedContext: true },
-          mcpCapabilities: { http: true, sse: false },
+          mcpCapabilities: { http: MODE !== 'stdio-mcp', sse: false },
           sessionCapabilities: { close: true, list: true },
         },
         agentInfo: { name: 'Fake Agent', version: '9.9.9' },
@@ -196,12 +197,23 @@ rl.on('line', (line) => {
       })
       return
     }
+    case 'authenticate': {
+      authenticated = params?.methodId ?? null
+      reply(id, {})
+      return
+    }
     case 'session/new': {
       const sessionId = `ses_fake_${sessions.size + 1}`
-      sessions.set(sessionId, { id: sessionId, cwd: params?.cwd, turns: 0, cancel: undefined })
+      sessions.set(sessionId, {
+        id: sessionId,
+        cwd: params?.cwd,
+        mcpServers: params?.mcpServers,
+        turns: 0,
+        cancel: undefined,
+      })
       reply(id, {
         sessionId,
-        configOptions: [
+        configOptions: MODE === 'no-model-options' ? [] : [
           {
             id: 'model',
             category: 'model',
@@ -246,6 +258,19 @@ rl.on('line', (line) => {
           currentValue: params.value,
           options: [{ value: params.value, name: params.value }],
         }],
+      })
+      return
+    }
+    case 'debug/state': {
+      reply(id, {
+        authenticated,
+        sessions: [...sessions.values()].map((session) => ({
+          id: session.id,
+          cwd: session.cwd,
+          turns: session.turns,
+          config: session.config ?? {},
+          mcpServers: session.mcpServers ?? [],
+        })),
       })
       return
     }
