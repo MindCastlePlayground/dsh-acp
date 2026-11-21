@@ -436,6 +436,26 @@ test('permission decisions fall back to cancelled when the agent offers no match
   assert.deepEqual(rejected, { outcome: { outcome: 'selected', optionId: 'no' } })
 })
 
+test('session reuse can be turned off per agent', async (t) => {
+  const config = makeConfig({ session: { reuse: 'fresh' } })
+  await withAgent(t, config, async (agent) => {
+    const adapter = createAcpAdapter({ agent, config: config.agents[0], log: agent.logs })
+    const call = (text) => collect(adapter.stream({
+      provider: 'acp-fake',
+      model: 'fake/model-one',
+      sessionId: 'dsh-fresh-session',
+      messages: [userTurn(text)],
+    }))
+    await call('one')
+    await call('two')
+    const state = await agent.connection.request('debug/state')
+    assert.equal(state.sessions.length, 1, 'each call retires the previous session')
+    assert.equal(state.sessions[0].turns, 1)
+    assert.equal(adapter.poolSize(), 1)
+    await adapter.release()
+  })
+})
+
 // --- MCP injection over a real session -------------------------------------
 
 /** A ctx whose services are the doubles a test cares about. */
