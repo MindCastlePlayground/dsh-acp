@@ -148,11 +148,13 @@ runs one, scoped to the DSH session that owns the model call.
 | `name` | `dsh` | Server name the agent sees. |
 | `transport` | `auto` | `auto` uses HTTP when the agent advertises `mcpCapabilities.http`, else the stdio shim. |
 | `tools.include` | `[]` | Tool-name masks to include; empty means every tool the agent's scope can see. |
-| `tools.exclude` | `['acp_*']` | Masks to remove. Always applied last. |
-| `prompts` | `true` | Expose DSH skills as MCP prompts. |
+| `tools.exclude` | `['acp_*']` | Masks to remove. Always applied last, and `acp_*` is re-applied even if you clear it. |
+| `prompts` | `true` | Expose DSH skills as MCP prompts. Prompts are a human surface, so they follow `userInvocable`. |
 | `resources` | `true` | Expose skills, a session summary, and read-only workspace files as MCP resources. |
-| `skills` | `true` | Expose a generated skill tool when the profile has skills but no `skill` tool. |
-| `skillToolName` | `dsh_skills` | Name of that generated tool. |
+| `skills` | `true` | Expose the generated skill tools when the profile has skills but no `skill` tool. |
+| `skillToolName` | `dsh_skills` | Name of the catalog/load tool. |
+| `skillReadToolName` | `dsh_skill_read` | Name of the tool that reads `SKILL.md` or a sibling reference file. |
+| `skillMaxBytes` | `120000` | Per-call budget for skill text (catalog or body), separate from `maxResultBytes`. |
 | `timeoutMs` | `600000` | Ceiling for one tool call. |
 | `maxResultBytes` | `262144` | Per-call result budget; longer output is truncated with a marker. |
 
@@ -160,12 +162,21 @@ What the agent receives:
 
 - **`tools`** — every tool visible to the owning DSH agent, which means every Cordis plugin's tools
   in this profile. Calls run through `ctx.tools.execute`, so DSH's approval policy, sandbox, guards,
-  and result pipeline still apply. `acp_*` is excluded by default so an agent cannot restart the
-  process it is talking to.
+  and result pipeline still apply. `acp_*` is never injected, whatever the config says: an agent that
+  can restart or reconfigure the process serving its own turn is a deadlock, not a capability.
+- **`dsh_skills` / `dsh_skill_read`** — the skill catalog, the full instructions of one skill, and any
+  file beside its `SKILL.md` (`reference/schema.md`, scripts). Both follow `modelInvocable`: a skill
+  flagged `disable-model-invocation` is neither listed nor loadable by name. Bodies are line-bounded
+  (`maxLines`, default 400, ceiling 2000) and the `<skill_resources>` section names the skill's own
+  directory, which is how an agent reaches its sibling files — they live outside the session cwd.
 - **`prompts`** — DSH skills, one prompt each, rendering the skill's instructions under the same
   `<skill_content>` wrapper DSH models see.
 - **`resources`** — `dsh://skill/<name>`, `dsh://session` (a JSON summary), and the
   `dsh://file/{+path}` template for UTF-8 files under the session directory.
+
+Every path crossing this bridge — workspace files, skill reference files, and the agent's own
+`fs/read_text_file` — is canonicalized with `realpath` and re-checked for containment, so a symlink
+pointing out of the tree is refused rather than followed.
 
 Every session gets its own token and endpoint; the token is the only credential, and passing it in an
 `Authorization` header (HTTP) or the shim's environment (stdio) is required. The listener binds to
@@ -185,12 +196,16 @@ Exponential backoff with a bounded budget, so a broken agent cannot spin forever
 A deliberate `acp_control stop`, a failed handshake, and an exhausted budget do **not** arm a
 restart — only an agent that dies while running does.
 
+Every spawned agent is also registered with a synchronous exit hook, so a crashed *host* does not
+orphan an agent (and the server it booted) holding a port and burning CPU. That hook only runs on
+process exit; a clean shutdown still goes through the ordinary `killTree` path.
+
 ### `permission`, `prompt`, `stream`, `logs`
 
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `permission.policy` | `allow` | `allow` grants `session/request_permission`; `deny` refuses and lets the agent continue. |
-| `permission.allowReadOnly` | `true` | Under `deny`, still allow `read`/`search`/`think`/`fetch` tool kinds. |
+| `permission.allowReadOnly` | `true` | Under `deny`, still allow `read`/`search`/`think`/`fetch`/`switch_mode` tool kinds. |
 | `prompt.includeToolActivity` | `true` | Include DSH tool calls and results when rendering a transcript for a fresh ACP session. |
 | `prompt.maxTranscriptChars` | `400000` | Prompt budget; older turns degrade to an omission marker. |
 | `stream.includeThoughts` | `true` | Map `agent_thought_chunk` onto DSH reasoning blocks. |
@@ -200,6 +215,15 @@ restart — only an agent that dies while running does.
 
 `permission` governs the agent's *own* tool calls, which happen inside the agent process. MCP tool
 calls are the other direction — DSH decides those, through its own approval and sandbox policy.
+Decisions are routed per ACP session, so two live sessions never share (or steal) a handler, and every
+decision is traced with its `sessionId`, tool `kind`, the option `kind` actually granted, and the full
+list offered. A grant that is not `allow_once` is also logged as a warning: a session-long grant is not
+a one-shot approval.
+
+`fs/read_text_file` and `fs/write_text_file` are confined to the **requesting session's** cwd, not the
+agent's most recent one — one process serves many sessions, so a shared boundary would write into the
+wrong directory. Both ends are canonicalized, so a symlink or junction pointing out of the tree is
+refused rather than followed.
 
 ## Tools
 
@@ -228,7 +252,12 @@ calls are the other direction — DSH decides those, through its own approval an
    `max_tokens → max-tokens`, `cancelled → aborted`, `refusal → stop`. A JSON-RPC error becomes
    `{kind: 'error', failure}` carrying the agent's code.
 5. **Cancellation.** Aborting the DSH stream sends `session/cancel` but keeps the wire request
-   pending, so the agent's `cancelled` answer still arrives and the session stays consistent.
+   pending, so the agent's `cancelled` answer still arrives and the session stays consistent. An agent
+   that ignores the cancel for 15 s has its turn abandoned and its session retired, rather than being
+   left to run into `turnTimeoutMs`.
+6. **No retry.** `providerRetryPolicy` states `maxRetries: 0` explicitly. DSH's default is five
+   retries for an HTTP endpoint; an ACP turn is a conversation, so a retry would replay a message the
+   agent already answered. Recovery belongs to the agent's restart budget instead.
 
 Usage is normalized to DSH's disjoint counts: ACP folds cache reads into `inputTokens`, so the
 adapter subtracts `cachedReadTokens` to keep `input + cacheRead + output` consistent. ACP's
@@ -241,8 +270,9 @@ arrive with the prompt result.
   equivalent; use the agent's own configuration or `session.options`.
 - **No image forwarding in either direction.** DSH attachments become placeholders in the transcript,
   and tool results carrying images are described rather than transferred.
-- **One turn at a time per session.** That matches how agents work; concurrent calls on the same DSH
-  session queue behind each other.
+- **One turn at a time per session.** That matches how agents work: a second concurrent call on the
+  same DSH session waits for the first to settle rather than putting two prompts on one ACP session,
+  which would interleave two histories into one.
 - **MCP tool calls are not written to the DSH transcript.** They appear in `acp_logs`; the DSH session
   records the model's answer, not the agent's internal tool use.
 - **Agent-specific config option ids are guesses when unrecognised.** `session.options` is the escape

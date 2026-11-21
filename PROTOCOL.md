@@ -177,14 +177,22 @@ The result carries **no content**. Everything the user sees arrives as notificat
 
 | Method | Bridge behaviour |
 | --- | --- |
-| `session/request_permission` | Answered from `permission.policy`; chooses `allow_once`/`allow_always`/`allow_session`, or `reject_once`/`reject_always`, or `{outcome:'cancelled'}` when no offered option fits. |
-| `fs/read_text_file` | Reads the requested file if it resolves inside the agent's `cwd`; honours `line`/`limit`. |
-| `fs/write_text_file` | Writes inside the agent's `cwd`, creating parent directories. |
+| `session/request_permission` | One handler per *process*, routed by `params.sessionId` into a per-session table; an unroutable ask answers `{outcome:'cancelled'}` instead of leaving the agent waiting. Answered from `permission.policy`; chooses `allow_once` then `allow_always`, or `reject_once` then `reject_always`, or `{outcome:'cancelled'}` when no offered option fits. |
+| `fs/read_text_file` | Reads the requested file if it resolves inside the **requesting session's** `cwd`; honours `line`/`limit` (either field alone is enough). |
+| `fs/write_text_file` | Writes inside the requesting session's `cwd`, creating parent directories. |
 | `fs/*` outside `cwd` | Refused with `ACP_PATH_ESCAPE` rather than touching an unexpected path. |
 | `terminal/*` | Not advertised (`terminal: false`), so a conforming agent will not ask. |
 
-Path confinement uses `path.relative(base, resolved)` and refuses anything starting with `..`,
-which also rejects a different drive on Windows.
+Path confinement is per session, not per agent: one process holds many sessions, so a shared boundary
+would apply the newest session's cwd to every other one and write into the wrong directory. An fs
+request whose `sessionId` is unknown falls back to the most recently established cwd, because some
+agents omit the field. Both the base and the target are canonicalized with `realpath` before the
+`path.relative(base, resolved)` test, so a symlink or junction inside the tree that points out of it is
+refused; a write target that does not exist yet is canonicalized through its deepest existing ancestor.
+The `..` test compares whole segments, so `..draft.md` is a legal child name.
+
+Every agent→client request is bounded: a handler that has not answered within 5 minutes is abandoned
+with `ACP_INBOUND_TIMEOUT` and traced, so a future asynchronous decision cannot wedge a tool call.
 
 ## Cancellation
 
@@ -196,6 +204,11 @@ which also rejects a different drive on Windows.
 The bridge sends `session/cancel` on abort but **keeps the prompt request pending**: the agent's
 `cancelled` result is what keeps session state consistent. The stream then ends with
 `{kind:'aborted'}`, never a silent stop.
+
+`session/cancel` is a notification, so nothing forces the agent to honour it. A 15 s fallback closes
+the update queue and abandons the turn — the session is retired, because an agent that ignored a
+cancel is in an unknown state. Without the fallback an ignored cancel would hold the turn, and its
+session slot, until `turnTimeoutMs` (900 s by default).
 
 ## Errors
 
@@ -240,8 +253,10 @@ Rules the mapper enforces:
 - The transport choice for MCP reads `agentCapabilities`, so the handshake must have finished before
   the descriptors are built. The bridge starts the agent first for exactly this reason; otherwise a
   first call would always fall back to stdio.
-- Only one prompt per session is in flight at a time. The bridge serializes because it pools one
-  session per DSH session id.
+- Only one prompt per session is in flight at a time, and this is enforced rather than assumed: a
+  second concurrent call on the same DSH session awaits the first turn's slot, because two prompts on
+  one ACP session interleave two histories. The slot is released in the turn's `finally`, including on
+  error and cancellation.
 - Conversation continuity across prompts on one session is real: a second prompt referring to the
   first is answered from context, which is what makes incremental prompting safe.
 - The agent may connect to the MCP endpoint at any point after `session/new` — before, during, or

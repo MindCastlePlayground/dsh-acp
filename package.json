@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-acp",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "type": "module",
   "description": "Mount any ACP (Agent Client Protocol) agent as a DeepSeek Harness model route, and inject DSH's tools into it over MCP.",
@@ -41,3 +41,4 @@
     }
   }
 }
+

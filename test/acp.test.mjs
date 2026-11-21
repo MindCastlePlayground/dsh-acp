@@ -9,9 +9,11 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { mkdtemp, mkdir, realpath, rm, symlink, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { normalizeConfig, AcpConfigError } from '../lib/config.js'
 import { AcpAgent } from '../lib/agent.js'
-import { createAcpAdapter, mapStopReason, mapUsage, decidePermission, contentText } from '../lib/adapter.js'
+import { createAcpAdapter, mapStopReason, mapUsage, decidePermission, contentText, refusalFailure, describeRpcError } from '../lib/adapter.js'
 import { planPrompt, renderTranscript, projectCall } from '../lib/transcript.js'
 import { McpGateway } from '../lib/mcp-gateway.js'
 import { createMcpBridge } from '../lib/mcp-bridge.js'
@@ -230,6 +232,32 @@ test('cancellation produces an aborted finish, not a silent stop', async (t) => 
   })
 })
 
+test('an agent that ignores session/cancel is abandoned instead of hanging', async (t) => {
+  // The agent never answers the prompt and never honours the cancel. Without a
+  // fallback the turn would sit until turnTimeoutMs, holding its session slot.
+  const config = makeConfig({ env: { FAKE_ACP_MODE: 'deaf' }, turnTimeoutMs: 120_000 })
+  await withAgent(t, config, async (agent) => {
+    const adapter = createAcpAdapter({ agent, config: config.agents[0], log: agent.logs })
+    const controller = new AbortController()
+    const startedAt = Date.now()
+    const stream = adapter.stream({
+      provider: 'acp-fake',
+      model: 'fake/model-one',
+      messages: [userTurn('ping')],
+      signal: controller.signal,
+    })
+    // Abort after the stream is live, then read it out: the fallback, not the
+    // 120 s turn timeout, has to be what ends this.
+    setTimeout(() => controller.abort(new Error('user cancelled')), 100).unref?.()
+    const { finish } = await collect(stream)
+    assert.equal(finish.kind, 'aborted')
+    assert.match(finish.failure.message, /did not answer session\/cancel/)
+    assert.ok(Date.now() - startedAt >= 15_000, 'the fallback waits for a real cancel window')
+    assert.ok(Date.now() - startedAt < 45_000, 'and ends the turn well before turnTimeoutMs')
+    await adapter.release()
+  })
+})
+
 test('a JSON-RPC error on the prompt becomes an error finish with the agent code', async (t) => {
   const config = makeConfig({ env: { FAKE_ACP_MODE: 'error' } })
   await withAgent(t, config, async (agent) => {
@@ -322,7 +350,10 @@ test('the adapter publishes the full duck-typed surface DSH validates', async (t
     for (const method of ['providerInfo', 'providerRetryPolicy', 'imageRequestPricing', 'imageRequestTarget', 'listModels', 'resolveModel', 'prepareCall', 'stream']) {
       assert.equal(typeof adapter[method], 'function', `adapter.${method} must exist`)
     }
-    assert.equal(adapter.providerRetryPolicy('acp-fake'), undefined)
+    // An ACP turn is a conversation, not a request: retrying replays a message
+    // the agent already answered, so no retry is stated explicitly rather than
+    // inherited from DSH's HTTP-oriented default of five.
+    assert.deepEqual(adapter.providerRetryPolicy('acp-fake'), { mode: 'normal', maxRetries: 0 })
     assert.equal(adapter.imageRequestPricing('acp-fake', 'fake/model-one'), undefined)
     assert.deepEqual(
       adapter.imageRequestTarget('acp-fake', 'fake/model-one', { width: 4, height: 5, bytes: 6 }),
@@ -357,6 +388,28 @@ test('stop reasons and usage map onto the DSH vocabulary', () => {
   assert.deepEqual(mapUsage({ inputTokens: 10, outputTokens: 2 }), {
     inputTokens: 10, outputTokens: 2, totalTokens: 12,
   })
+})
+
+test('a refusal with a machine-readable reason becomes an error, not an empty answer', () => {
+  assert.equal(refusalFailure(undefined), undefined)
+  assert.equal(refusalFailure({ unrelated: true }), undefined)
+  assert.deepEqual(refusalFailure({ error: 'quota exceeded' }), {
+    code: 'RATE_LIMITED',
+    message: 'the ACP agent refused the turn (error: quota exceeded)',
+  })
+  // A non-quota reason is still a failure, just a different code.
+  assert.equal(refusalFailure({ detail: 'policy declined' }).code, 'REFUSED')
+  // A hostile shape must not throw out of the finish path.
+  const cyclic = { a: {} }
+  cyclic.a.b = cyclic
+  assert.equal(refusalFailure(cyclic), undefined)
+
+  // An ACP error's `data` carries the agent's own classification; keep it.
+  assert.equal(
+    describeRpcError({ message: 'Insufficient balance', data: { service: 'session', errorName: 'provider.quota' } }),
+    'Insufficient balance (errorName=provider.quota, service=session)',
+  )
+  assert.equal(describeRpcError({ message: 'plain' }), 'plain')
 })
 
 test('transcript planning chooses delta or fresh from the recorded prefix', () => {
@@ -423,6 +476,20 @@ test('projection flattens tool blocks and honours the tool-activity switch', () 
   assert.equal(withoutTools.segments.length, 2)
   assert.equal(contentText([{ type: 'text', text: 'x' }, { type: 'text', text: 'y' }]), 'xy')
   assert.equal(contentText({ type: 'content', content: { type: 'text', text: 'z' } }), 'z')
+
+  // A block kind this bridge does not model still reaches the transcript: an
+  // agent's `audio` or a newer payload must not vanish into an empty string.
+  assert.match(contentText({ type: 'audio', mimeType: 'audio/wav' }), /\[audio audio\/wav\]/)
+  assert.match(contentText({ type: 'terminal', terminalId: 't7' }), /\[terminal\] .*t7/)
+  assert.match(contentText({ type: 'image', mimeType: 'image/png', data: 'aaaa' }), /\[image image\/png, 4 base64 chars\]/)
+
+  // A diff is the agent's actual edit, so it is rendered as a patch — trimmed to
+  // the lines that actually differ.
+  const diff = contentText({ type: 'diff', path: 'src/a.js', oldText: 'a\nb', newText: 'a\nc' })
+  assert.equal(diff, '[diff src/a.js]\n  a\n- b\n+ c')
+
+  // And the per-block cap keeps one runaway payload out of the prompt.
+  assert.ok(contentText({ type: 'text', text: 'z'.repeat(40_000) }).length < 20_000)
 })
 
 test('permission decisions fall back to cancelled when the agent offers no matching option', () => {
@@ -433,7 +500,56 @@ test('permission decisions fall back to cancelled when the agent offers no match
     toolCall: { kind: 'edit' },
     options: [{ optionId: 'no', kind: 'reject_once' }],
   }, { trace() {} })
-  assert.deepEqual(rejected, { outcome: { outcome: 'selected', optionId: 'no' } })
+  assert.deepEqual(rejected.outcome, { outcome: 'selected', optionId: 'no' })
+  assert.equal(rejected.grantedKind, 'reject_once')
+
+  // The narrowest grant wins, and the kind is reported so a blanket grant is
+  // visible instead of looking like a one-shot approval.
+  const narrowest = decidePermission(config, {
+    toolCall: { kind: 'edit' },
+    options: [{ optionId: 'a', kind: 'allow_always' }, { optionId: 'o', kind: 'allow_once' }],
+  }, { trace() {} })
+  assert.equal(narrowest.outcome.optionId, 'o')
+  assert.equal(narrowest.grantedKind, 'allow_once')
+
+  // `allow_always` is a real ACP kind and is used when it is all that is offered;
+  // `allow_session` is not in the protocol, so it is never invented as a grant.
+  const alwaysOnly = decidePermission(config, {
+    toolCall: { kind: 'edit' },
+    options: [{ optionId: 'a', kind: 'allow_always' }],
+  }, { trace() {} })
+  assert.equal(alwaysOnly.grantedKind, 'allow_always')
+  assert.deepEqual(
+    decidePermission(config, { toolCall: { kind: 'edit' }, options: [{ optionId: 's', kind: 'allow_session' }] }, { trace() {} }),
+    { outcome: { outcome: 'cancelled' } },
+  )
+})
+
+test('concurrent calls on one DSH session serialise instead of interleaving', async (t) => {
+  const config = makeConfig()
+  await withAgent(t, config, async (agent) => {
+    const adapter = createAcpAdapter({ agent, config: config.agents[0], log: agent.logs })
+    const call = (text) => collect(adapter.stream({
+      provider: 'acp-fake',
+      model: 'fake/model-one',
+      sessionId: 'dsh-concurrent',
+      messages: [userTurn(text)],
+    }))
+    // Two calls on one DSH session would otherwise put two prompts on one ACP
+    // session at once, interleaving two histories into one.
+    const [first, second] = await Promise.all([call('alpha'), call('beta')])
+    assert.equal(first.finish.kind, 'stop')
+    assert.equal(second.finish.kind, 'stop')
+    const prompts = agent.logs.entries
+      .map((slot) => slot.entry)
+      .filter((entry) => entry.stream === 'out' && String(entry.text ?? '').includes('session/prompt'))
+    assert.equal(prompts.length, 2)
+    // The slot is claimed before the session is resolved, so the queued call
+    // reuses the first call's session instead of retiring it mid-stream.
+    const state = await agent.connection.request('debug/state')
+    assert.equal(state.sessions.length, 1, 'both calls share one ACP session')
+    await adapter.release()
+  })
 })
 
 test('session reuse can be turned off per agent', async (t) => {
@@ -631,4 +747,76 @@ test('session options and authenticate are applied generically', async (t) => {
     assert.equal(after.sessions[0].config.custom_option, 'custom-value')
     await adapter.release()
   })
+})
+
+test('the fs fence is per session and refuses symlink escapes', async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'dsh-acp-fence-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  await mkdir(path.join(root, 'one'), { recursive: true })
+  await mkdir(path.join(root, 'two'), { recursive: true })
+  await writeFile(path.join(root, 'two', 'other.txt'), 'other', 'utf8')
+  await writeFile(path.join(root, 'one', 'own.txt'), 'own', 'utf8')
+  const realOne = await realpath(path.join(root, 'one'))
+  const realTwo = await realpath(path.join(root, 'two'))
+
+  const config = makeConfig()
+  await withAgent(t, config, async (agent) => {
+    // Two sessions with different cwds, as one process really has.
+    agent.rememberCwd('sess-one', realOne)
+    agent.rememberCwd('sess-two', realTwo)
+
+    assert.equal(await agent.resolveFsPath('own.txt', 'sess-one'), path.join(realOne, 'own.txt'))
+    // The crucial case: session two's file must NOT be reachable from session one,
+    // even though both belong to the same agent process.
+    await assert.rejects(
+      agent.resolveFsPath(path.join('..', 'two', 'other.txt'), 'sess-one'),
+      (error) => error.code === 'ACP_PATH_ESCAPE',
+    )
+    // A legal child whose name merely starts with dots is not an escape.
+    await writeFile(path.join(realOne, '..draft.md'), 'draft', 'utf8')
+    assert.equal(await agent.resolveFsPath('..draft.md', 'sess-one'), path.join(realOne, '..draft.md'))
+
+    // An unknown session id falls back to the most recent cwd rather than being
+    // refused, because some agents omit `sessionId` from fs requests.
+    assert.equal(await agent.resolveFsPath('own.txt', 'sess-unknown'), path.join(realTwo, 'own.txt'))
+
+    // A symlink inside the tree that points out of it is refused after
+    // canonicalization, while an in-tree link still resolves.
+    try {
+      await symlink(realTwo, path.join(realOne, 'escape'), 'junction')
+    } catch {
+      return // no junction rights on this host; the lexical checks above still ran
+    }
+    await assert.rejects(
+      agent.resolveFsPath(path.join('escape', 'other.txt'), 'sess-one'),
+      (error) => error.code === 'ACP_PATH_ESCAPE',
+    )
+  })
+
+  // A brand-new agent has no cwd at all: the fence refuses instead of guessing.
+  const fresh = new AcpAgent({ config: config.agents[0], ctx: makeCtx(), resolveCwd: () => process.cwd() })
+  t.after(() => fresh.dispose())
+  await assert.rejects(fresh.resolveFsPath('x.txt', 'unknown'), (error) => error.code === 'ACP_NO_SESSION_CWD')
+})
+
+test('a spawned agent is registered with a synchronous exit reaper', async () => {
+  const { trackAgentChild } = await import('../lib/process.js')
+  const { spawn } = await import('node:child_process')
+
+  // A host crash cannot await `killTree`, so every spawned agent needs a hook
+  // that runs when this process exits; without it the agent outlives the host.
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
+  const forget = trackAgentChild(child)
+  assert.equal(typeof forget, 'function')
+  const listeners = process.listenerCount('exit')
+  assert.ok(listeners > 0, 'an exit hook must be armed')
+
+  // A child that exits on its own is forgotten, so the reaper never reaps a pid
+  // that the operating system may since have reused.
+  const exited = new Promise((resolve) => child.once('exit', resolve))
+  child.kill('SIGKILL')
+  await exited
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  forget()
+  assert.ok(process.listenerCount('exit') >= listeners - 1)
 })

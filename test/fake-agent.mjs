@@ -128,6 +128,14 @@ async function handlePrompt(id, params) {
     reply(id, { stopReason: 'cancelled' })
     return
   }
+  if (MODE === 'deaf') {
+    // An agent that neither answers the prompt nor honours session/cancel: the
+    // bridge must give up on its own rather than hold the turn forever.
+    await new Promise((resolve) => setTimeout(resolve, 30_000).unref?.())
+    reply(id, { stopReason: 'end_turn' })
+    return
+  }
+
   // Split the answer so the bridge must coalesce multiple chunks per block.
   const half = Math.ceil(TEXT.length / 2)
   for (const part of [TEXT.slice(0, half), TEXT.slice(half)]) {

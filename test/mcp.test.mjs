@@ -8,6 +8,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import path from 'node:path'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { spawn } from 'node:child_process'
 import { McpServer, MCP_ERRORS, MCP_LATEST_PROTOCOL, truncateContent } from '../lib/mcp.js'
@@ -70,8 +72,11 @@ function stubSkills() {
       ]
     },
     async get(name) {
-      if (name !== 'demo-skill') return undefined
-      return { name, description: 'A demo skill.', content: 'Do the demo thing.', whenToUse: 'when demoing' }
+      if (name === 'demo-skill') return { name, description: 'A demo skill.', content: 'Do the demo thing.', whenToUse: 'when demoing' }
+      // Readable, but flagged: the loader must refuse it for a model surface
+      // even though the name resolves.
+      if (name === 'internal-only') return { name, description: 'Hidden.', content: 'internal body', invocation: { modelInvocable: false, userInvocable: true } }
+      return undefined
     },
   }
 }
@@ -110,6 +115,10 @@ test('tool masks select by include and always honour exclude', () => {
   assert.deepEqual(selectTools(tools, { include: ['read_*'], exclude: [] }).map((tool) => tool.name), ['read_file'])
   // Exclude wins over include, so a wide mask cannot re-expose a control tool.
   assert.deepEqual(selectTools(tools, { include: ['acp_*'], exclude: ['acp_*'] }), [])
+  // And `acp_*` cannot be un-excluded: an agent that can restart the process
+  // serving its own turn is a deadlock, not a capability.
+  assert.deepEqual(selectTools(tools, { include: [], exclude: [] }).map((tool) => tool.name), ['bash', 'read_file'])
+  assert.deepEqual(selectTools(tools, { include: ['acp_*'], exclude: [] }), [])
 })
 
 test('initialize advertises only the capabilities the surface implements', async () => {
@@ -137,8 +146,12 @@ test('tools list and call round-trip through the registry', async () => {
 
   const listed = await call(server, 'tools/list')
   const names = listed.result.tools.map((tool) => tool.name)
-  assert.deepEqual(names, ['bash', 'read_file', 'dsh_skills'])
+  assert.deepEqual(names, ['bash', 'read_file', 'dsh_skills', 'dsh_skill_read'])
   assert.equal(listed.result.tools[0].inputSchema.required[0], 'command')
+  // The read tool names its one required argument, so an agent cannot trigger a
+  // full catalog dump by accident.
+  assert.deepEqual(listed.result.tools[3].inputSchema.required, ['name'])
+  assert.equal(listed.result.tools[3].annotations.readOnlyHint, true)
 
   const ok = await call(server, 'tools/call', { name: 'bash', arguments: { command: 'echo hi' } })
   assert.equal(ok.result.isError, undefined)
@@ -175,12 +188,139 @@ test('the generated skill tool lists and loads skills', async () => {
 
   const missing = await call(server, 'tools/call', { name: 'dsh_skills', arguments: { name: 'ghost' } })
   assert.equal(missing.result.isError, true)
+
+  // The listing hides a user-only skill; loading it by name is refused too, so
+  // the flag guards the body rather than only the catalog.
+  const hidden = await call(server, 'tools/call', { name: 'dsh_skills', arguments: { name: 'internal-only' } })
+  assert.equal(hidden.result.isError, true)
+  assert.match(hidden.result.content[0].text, /not available for model invocation/)
+  const hiddenResource = await call(server, 'resources/read', { uri: 'dsh://skill/internal-only' })
+  assert.equal(hiddenResource.error.code, MCP_ERRORS.invalidParams)
+})
+
+test('a skill body is line-bounded and names the directory its references live in', async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'dsh-acp-skill-'))
+  mkdirSync(path.join(dir, 'reference'))
+  writeFileSync(path.join(dir, 'reference', 'schema.md'), 'the schema\n')
+  writeFileSync(path.join(dir, 'SKILL.md'), Array.from({ length: 12 }, (_, i) => `line ${i + 1}`).join('\n'))
+  const skills = {
+    async list() { return [{ name: 'long-skill', description: 'A long one.' }] },
+    async get(name) {
+      if (name !== 'long-skill') return undefined
+      return {
+        name,
+        description: 'A long one.',
+        content: readFileSync(path.join(dir, 'SKILL.md'), 'utf8'),
+        resourceBase: { kind: 'directory', path: dir },
+      }
+    },
+  }
+  const ctx = stubCtx({ skills })
+  const { server } = makeServer({ ctx })
+
+  const full = await call(server, 'tools/call', { name: 'dsh_skills', arguments: { name: 'long-skill', maxLines: 3 } })
+  assert.match(full.result.content[0].text, /line 3/)
+  assert.doesNotMatch(full.result.content[0].text, /line 4/)
+  assert.match(full.result.content[0].text, /\[truncated: showing the first 3 of 12 lines/)
+
+  // The base directory reaches the agent, so its own read tools can follow it.
+  assert.match(full.result.content[0].text, /<skill_resources>/)
+  assert.ok(full.result.content[0].text.includes(`Base directory for this skill: ${dir}`))
+
+  // Sibling files are readable through the skill tool; the session cwd cannot
+  // reach them, because a skills root is a different tree.
+  const sibling = await call(server, 'tools/call', { name: 'dsh_skill_read', arguments: { name: 'long-skill', file: 'reference/schema.md' } })
+  assert.equal(sibling.result.isError, undefined)
+  assert.equal(sibling.result.content[0].text, 'the schema\n')
+
+  // Escape attempts and a missing name stay tool failures, never protocol errors.
+  for (const file of ['../secret', '/etc/passwd', 'reference/../../secret']) {
+    const refused = await call(server, 'tools/call', { name: 'dsh_skill_read', arguments: { name: 'long-skill', file } })
+    assert.equal(refused.result.isError, true, file)
+  }
+  const nameless = await call(server, 'tools/call', { name: 'dsh_skill_read', arguments: {} })
+  assert.equal(nameless.result.isError, true)
+
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('a broken skill service fails loudly instead of claiming an empty profile', async () => {
+  const skills = {
+    async list() { throw new Error('registry is down') },
+    async get() { throw new Error('registry is down') },
+  }
+  const { server } = makeServer({ ctx: stubCtx({ skills }) })
+  const listed = await call(server, 'tools/call', { name: 'dsh_skills', arguments: {} })
+  assert.equal(listed.result.isError, true)
+  assert.match(listed.result.content[0].text, /skill service failed/)
+})
+
+test('a cancelled tools/call aborts the DSH tool it started', async () => {
+  let seen
+  const tools = {
+    schemas: () => [{ name: 'slow', description: 'Slow.', parameters: { type: 'object', properties: {} } }],
+    async execute(exec) {
+      seen = exec.signal
+      // A tool that honours its signal: it ends as soon as the client gives up.
+      await new Promise((resolve) => {
+        exec.signal.addEventListener('abort', resolve, { once: true })
+        setTimeout(resolve, 5_000).unref?.()
+      })
+      return { isError: false, content: [{ type: 'text', text: 'done' }] }
+    },
+  }
+  const { server } = makeServer({ ctx: stubCtx({ tools }) })
+
+  const pending = server.handle({ jsonrpc: '2.0', id: 77, method: 'tools/call', params: { name: 'slow', arguments: {} } })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(seen.aborted, false)
+
+  // Notifications are never answered, and the cancellation reaches the tool.
+  assert.equal(await server.handle({
+    jsonrpc: '2.0',
+    method: 'notifications/cancelled',
+    params: { requestId: 77, reason: 'user stopped the turn' },
+  }), undefined)
+  assert.equal(seen.aborted, true)
+  assert.equal((await pending).result.isError, undefined)
+
+  // An unknown request id is logged and ignored rather than throwing.
+  assert.equal(await server.handle({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 999 } }), undefined)
+})
+
+test('null arguments stay a protocol error while omitted ones stay legal', async () => {
+  const { server } = makeServer()
+  const explicitNull = await call(server, 'tools/call', { name: 'bash', arguments: null })
+  assert.equal(explicitNull.error.code, MCP_ERRORS.invalidParams)
+  const array = await call(server, 'tools/call', { name: 'bash', arguments: [] })
+  assert.equal(array.error.code, MCP_ERRORS.invalidParams)
+  const omitted = await call(server, 'tools/call', { name: 'dsh_skills' })
+  assert.equal(omitted.result.isError, undefined)
+})
+
+test('an oversized skill payload is capped by skillMaxBytes, not maxResultBytes', async () => {
+  const skills = {
+    async list() { return [{ name: 'huge', description: 'x'.repeat(5_000) }] },
+    async get(name) { return name === 'huge' ? { name, description: 'huge', content: 'y'.repeat(20_000) } : undefined },
+  }
+  const { server } = makeServer({ config: makeConfig({ mcp: { skillMaxBytes: 2_048 } }), ctx: stubCtx({ skills }) })
+
+  const catalog = await call(server, 'tools/call', { name: 'dsh_skills', arguments: {} })
+  assert.ok(Buffer.byteLength(catalog.result.content[0].text, 'utf8') <= 2_048)
+  // A multi-kilobyte description is capped per entry and collapsed to one line.
+  assert.match(catalog.result.content[0].text, /…/)
+
+  const body = await call(server, 'tools/call', { name: 'dsh_skills', arguments: { name: 'huge' } })
+  assert.ok(Buffer.byteLength(body.result.content[0].text, 'utf8') <= 2_048)
+  assert.match(body.result.content[0].text, /truncated/)
 })
 
 test('prompts and resources expose skills, and file reads stay inside cwd', async () => {
   const { server } = makeServer()
   const prompts = await call(server, 'prompts/list')
-  assert.deepEqual(prompts.result.prompts.map((prompt) => prompt.name), ['demo-skill'])
+  // Prompts are the human surface, so they follow `userInvocable` — the inverse
+  // of the model catalog, which hides this same skill.
+  assert.deepEqual(prompts.result.prompts.map((prompt) => prompt.name), ['demo-skill', 'internal-only'])
 
   const prompt = await call(server, 'prompts/get', { name: 'demo-skill' })
   assert.equal(prompt.result.messages[0].role, 'user')
@@ -205,10 +345,11 @@ test('prompts and resources expose skills, and file reads stay inside cwd', asyn
   const pkg = await call(server, 'resources/read', { uri: 'dsh://file/package.json' })
   assert.match(pkg.result.contents[0].text, /"name": "@local\/dsh-acp"/)
 
-  // Traversal out of the session directory is refused, not resolved.
+  // Traversal out of the session directory is refused, not resolved — and it is
+  // the caller's error, not an internal one.
   const escape = await call(server, 'resources/read', { uri: 'dsh://file/../../etc/passwd' })
-  assert.equal(escape.error.code, MCP_ERRORS.internal)
-  assert.match(escape.error.message, /outside the session directory/)
+  assert.equal(escape.error.code, MCP_ERRORS.invalidParams)
+  assert.match(escape.error.message, /outside the directory/)
 })
 
 test('notifications are never answered and unknown methods fail cleanly', async () => {
@@ -287,7 +428,7 @@ test('the HTTP gateway authenticates by capability token only', async (t) => {
   assert.equal(await notification.text(), '')
 
   const listed = await post({ jsonrpc: '2.0', id: 2, method: 'tools/list' }, { authorization: `Bearer ${endpoint.token}` })
-  assert.equal((await listed.json()).result.tools.length, 3)
+  assert.equal((await listed.json()).result.tools.length, 4)
 
   // GET carries no server-initiated stream in this implementation.
   const get = await fetch(url, { headers: { authorization: `Bearer ${endpoint.token}` } })
